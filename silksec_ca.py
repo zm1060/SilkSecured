@@ -1,122 +1,77 @@
 import ssl
 import socket
-import fnmatch
+from OpenSSL import crypto
+import json
 
-
-def parse_certificate_info(cert_info):
+def parse_certificate_info(cert_bin):
     """
-    Parses certificate information and extracts relevant details.
+    Parses binary certificate information and extracts relevant details.
 
     Parameters:
-        cert_info (dict): Dictionary containing certificate information.
+        cert_bin (bytes): Binary certificate information.
 
     Returns:
         dict: Parsed certificate information.
     """
-    parsed_info = {}
+    x509 = crypto.load_certificate(crypto.FILETYPE_ASN1, cert_bin)
+    cert_info = {
+        "Common Name": x509.get_subject().CN,
+        "Organization": x509.get_subject().O or 'None',
+        "Organizational Unit": x509.get_subject().OU or 'None',
+        "Serial Number": '{0:x}'.format(x509.get_serial_number()).zfill(32),
+        "Issuer Common Name": x509.get_issuer().CN,
+        "Issuer Organization": x509.get_issuer().O or 'None',
+        "Issuer Organizational Unit": x509.get_issuer().OU or 'None',
+        "Not Before": x509.get_notBefore().decode('utf-8'),
+        "Not After": x509.get_notAfter().decode('utf-8'),
+        "Public Key": crypto.dump_publickey(crypto.FILETYPE_PEM, x509.get_pubkey()).decode('utf-8'),
+        "Signature Algorithm": x509.get_signature_algorithm().decode('utf-8'),
+        "Version": x509.get_version() + 1,
+        "SHA-1 Fingerprint": x509.digest('sha1').decode('utf-8'),
+        "SHA-256 Fingerprint": x509.digest('sha256').decode('utf-8'),
+        "Extended Key Usage": None,
+        "Key Usage": None,
+        "Subject Alternative Name": []
+    }
 
-    # Extract subject details
-    subject = cert_info.get('subject', [])
-    for attr_list in subject:
-        for attr, value in attr_list:
-            if attr == 'countryName':
-                parsed_info['Subject_Country'] = value
-            elif attr == 'stateOrProvinceName':
-                parsed_info['Subject_State'] = value
-            elif attr == 'localityName':
-                parsed_info['Subject_Locality'] = value
-            elif attr == 'organizationName':
-                parsed_info['Subject_Organization'] = value
-            elif attr == 'commonName':
-                parsed_info['Subject_CommonName'] = value
+    # Extend
+    for i in range(x509.get_extension_count()):
+        ext = x509.get_extension(i)
+        short_name = ext.get_short_name()
+        if short_name == b'extendedKeyUsage':
+            cert_info["Extended Key Usage"] = ext.__str__()
+        elif short_name == b'keyUsage':
+            cert_info["Key Usage"] = ext.__str__()
+        elif short_name == b'subjectAltName':
+            san_list = [san_value.strip() for san_value in str(ext).split(",")]
+            cert_info["Subject Alternative Name"] = san_list
 
-    # Extract issuer details
-    issuer = cert_info.get('issuer', [])
-    for attr_list in issuer:
-        for attr, value in attr_list:
-            if attr == 'countryName':
-                parsed_info['Issuer_Country'] = value
-            elif attr == 'organizationName':
-                parsed_info['Issuer_Organization'] = value
-            elif attr == 'commonName':
-                parsed_info['Issuer_CommonName'] = value
+    return cert_info
 
-    # Extract subjectAltName
-    subject_alt_name = cert_info.get('subjectAltName', [])
-    parsed_info['SubjectAltName'] = [value for _, value in subject_alt_name] if subject_alt_name else None
-
-    # Extract notBefore and notAfter
-    parsed_info['NotBefore'] = cert_info.get('notBefore', '')
-    parsed_info['NotAfter'] = cert_info.get('notAfter', '')
-
-    return parsed_info
-
-
-def fqdn_match(host, cert_info):
+def get_tls_info(domain):
     """
-    Checks if the host matches any of the subject alternative names or common name in the certificate.
+    Connects to a server and retrieves TLS certificate information.
 
     Parameters:
-        host (str): The hostname to check.
-        cert_info (dict): The certificate information.
+        domain (str): The domain name to connect to.
 
     Returns:
-        bool: True if there's a match, False otherwise.
+        dict: The parsed certificate information.
     """
-    san = cert_info.get('subjectAltName', [])
-    for entry in san:
-        _, san_host = entry
-        if fnmatch.fnmatch(host, san_host):
-            return True
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect((domain, 443))
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    s = context.wrap_socket(s, server_hostname=domain)
+    cert_bin = s.getpeercert(True)
+    s.close()
 
-    # Fallback to common name if SAN is not available or no match found
-    cn = next((val for ((attr, val),) in cert_info.get('subject', []) if attr == 'commonName'), None)
-    if cn and fnmatch.fnmatch(host, cn):
-        return True
-
-    return False
-
-
-def get_tls_info(host, port=443):
-    """
-    Tests the TLS version and retrieves certificate information of a server.
-
-    Parameters:
-        host (str): Hostname or IP address of the server.
-        port (int): Port number. Default is 443.
-
-    Returns:
-        dict: Dictionary containing TLS information including version, certificate, cipher, host, and FQDN match.
-    """
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=host) as ssock:
-                tls_version = ssock.version()
-                cert_info = ssock.getpeercert()
-                cipher = ssock.cipher()
-
-                # Check if the common name or any SAN matches the actual hostname
-                fqdn_match_result = fqdn_match(host, cert_info)
-
-                return {
-                    'TLS_Version': tls_version,
-                    'Certificate_Info': parse_certificate_info(cert_info),
-                    'Cipher': cipher,
-                    'Host': host,
-                    'FQDN_Match': fqdn_match_result
-                }
-
-    except Exception as e:
-        return {
-            'TLS_Version': None,
-            'Certificate_Info': None,
-            'Cipher': None,
-            'Host': host,
-            'FQDN_Match': False,
-            'Error': str(e)
-        }
-
+    cert_info = parse_certificate_info(cert_bin)
+    return cert_info
 
 if __name__ == '__main__':
-    print(get_tls_info('www.baidu.com'))
+    domain = 'google.com'
+    cert_info = get_tls_info(domain)
+    print(json.dumps(cert_info, indent=4))
